@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/gdamore/tcell/v2"
 	"github.com/joho/godotenv"
 	"github.com/rivo/tview"
@@ -894,6 +895,32 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 	endDateField := tview.NewInputField().SetLabel("End Date (YYYY-MM-DD): ").SetText(endDateValue).SetFieldWidth(30)
 	limitField := tview.NewInputField().SetLabel("Limit: ").SetText(limitValue).SetFieldWidth(10)
 
+	// Enable paste by handling Ctrl+V
+	enablePaste := func(field *tview.InputField) {
+		field.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+			// Handle Ctrl+V (or Cmd+V on Mac)
+			if event.Key() == tcell.KeyCtrlV || (event.Modifiers()&tcell.ModCtrl != 0 && event.Rune() == 'v') {
+				// Read from clipboard
+				if text, err := clipboard.ReadAll(); err == nil && text != "" {
+					// Get current text and cursor position
+					currentText := field.GetText()
+					// Append pasted text to current text
+					field.SetText(currentText + text)
+				}
+				return nil // Consume the event
+			}
+			// Allow all other keys to pass through
+			return event
+		})
+	}
+
+	enablePaste(dbField)
+	enablePaste(tableField)
+	enablePaste(pkField)
+	enablePaste(startDateField)
+	enablePaste(endDateField)
+	enablePaste(limitField)
+
 	// Add all fields to form
 	form.AddFormItem(dbField)
 	form.AddFormItem(tableField)
@@ -1097,6 +1124,12 @@ func main() {
 	state := newAppState(nil)
 	app := tview.NewApplication().EnableMouse(true)
 	state.app = app
+
+	// Enable bracketed paste mode for better paste support
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		screen.EnablePaste()
+		return false
+	})
 
 	pages := createMainUI(state)
 
