@@ -17,6 +17,7 @@ Continuously captures MySQL binlog events and stores them in MongoDB with:
 - Staging collection for crash recovery
 - Atomic transactions (batch + GTID offset together)
 - Exponential backoff retry (5 attempts over ~30 seconds)
+- Canal reconnection for protocol errors (10 attempts over ~10 minutes)
 - Schema change detection
 - Graceful shutdown on SIGTERM/SIGINT
 

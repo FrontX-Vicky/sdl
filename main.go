@@ -645,6 +645,94 @@ func getenv(k, def string) string {
 	return def
 }
 
+// runCanalWithRetry runs Canal with automatic reconnection on protocol errors
+func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetries int) error {
+	var lastErr error
+	baseDelay := 2 * time.Second
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(1<<uint(attempt-1)) * baseDelay
+			if delay > 60*time.Second {
+				delay = 60 * time.Second
+			}
+			log.Printf("Canal retry attempt %d/%d after %v (previous error: %v)", attempt+1, maxRetries, delay, lastErr)
+			time.Sleep(delay)
+		}
+
+		// Load position from MongoDB
+		gtidStr, ok, err := sink.loadGTID(context.Background(), source)
+		if err != nil {
+			log.Printf("Warning: Could not load GTID from MongoDB: %v", err)
+		}
+
+		// Start Canal from saved position or master's current position
+		if ok && gtidStr != "" {
+			gtidSet, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtidStr)
+			if err != nil {
+				log.Printf("Warning: Could not parse saved GTID '%s': %v, falling back to master position", gtidStr, err)
+				ok = false
+			} else {
+				log.Printf("Resuming from saved GTID: %s (attempt %d/%d)", gtidStr, attempt+1, maxRetries)
+				if err := c.StartFromGTID(gtidSet); err != nil {
+					lastErr = fmt.Errorf("start from GTID: %w", err)
+					continue
+				}
+			}
+		}
+
+		if !ok || gtidStr == "" {
+			// No saved GTID, start from master's current position
+			gset, err := c.GetMasterGTIDSet()
+			if err != nil {
+				lastErr = fmt.Errorf("get master GTID: %w", err)
+				continue
+			}
+			log.Printf("Starting from master's GTID set: %s (attempt %d/%d)", gset.String(), attempt+1, maxRetries)
+			if err := c.StartFromGTID(gset); err != nil {
+				lastErr = fmt.Errorf("start from master GTID: %w", err)
+				continue
+			}
+		}
+
+		// Run Canal - this blocks until error or stopped
+		log.Printf("Canal running (attempt %d/%d)...", attempt+1, maxRetries)
+		err = c.Run()
+
+		if err == nil {
+			return nil // Normal shutdown
+		}
+
+		lastErr = err
+		errStr := err.Error()
+
+		// Check for recoverable protocol errors
+		isRecoverable := strings.Contains(errStr, "invalid sequence") ||
+			strings.Contains(errStr, "connection refused") ||
+			strings.Contains(errStr, "connection reset") ||
+			strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "EOF") ||
+			strings.Contains(errStr, "i/o timeout")
+
+		if !isRecoverable {
+			log.Printf("Non-recoverable Canal error: %v", err)
+			return err
+		}
+
+		log.Printf("Recoverable Canal error detected: %v", err)
+
+		// Close the Canal instance to reset connection
+		log.Println("Closing Canal connection for reconnection...")
+		c.Close()
+
+		// Brief pause before retry
+		time.Sleep(1 * time.Second)
+	}
+
+	log.Printf("Max Canal retries (%d) exceeded, last error: %v", maxRetries, lastErr)
+	return fmt.Errorf("canal retry exhausted after %d attempts: %w", maxRetries, lastErr)
+}
+
 func main() {
 	// Load .env (absolute path is safest under systemd)
 	_ = godotenv.Load(".env")
@@ -711,30 +799,11 @@ func main() {
 			// Don't fail startup, continue with replication
 		}
 
-		// Resume from saved GTID if present
-		if gtidStr, ok, _ := sink.loadGTID(context.Background(), h.source); ok && gtidStr != "" {
-			gtidSet, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtidStr)
-			if err != nil {
-				errChan <- fmt.Errorf("parse GTID: %w", err)
-				return
-			}
-			log.Printf("Resuming from saved GTID: %s", gtidStr)
-			if err := c.StartFromGTID(gtidSet); err != nil {
-				errChan <- err
-				return
-			}
-		} else {
-			// GTID_MODE=ON ⇒ start from master's current GTID set (AUTO_POSITION)
-			gset, err := c.GetMasterGTIDSet()
-			if err != nil {
-				errChan <- fmt.Errorf("GetMasterGTIDSet: %w", err)
-				return
-			}
-			log.Printf("Starting from master's GTID set: %s", gset.String())
-			if err := c.StartFromGTID(gset); err != nil {
-				errChan <- err
-				return
-			}
+		// Run Canal with automatic retry on protocol errors
+		// Max 10 retries with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s...)
+		if err := runCanalWithRetry(c, sink, h.source, 10); err != nil {
+			errChan <- err
+			return
 		}
 	}()
 
