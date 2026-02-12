@@ -585,6 +585,62 @@ Create alerts for these conditions:
 
 ---
 
+---
+
+### Service Won't Start - Permission Denied
+
+**Symptoms:**
+```
+Failed to locate executable /var/www/go-workspace/sdl/sdl_binary: Permission denied
+Failed at step EXEC spawning: Permission denied
+```
+
+**Root Cause:**
+Binary file doesn't have execute permissions or wrong ownership.
+
+**Solution:**
+```bash
+# 1. Fix binary permissions
+sudo chmod +x /var/www/go-workspace/sdl/sdl_binary
+
+# 2. Fix ownership (match systemd User/Group)
+sudo chown your_user:your_group /var/www/go-workspace/sdl/sdl_binary
+
+# 3. Fix directory permissions
+sudo chmod 755 /var/www/go-workspace/sdl
+
+# 4. Verify permissions
+ls -la /var/www/go-workspace/sdl/sdl_binary
+# Should show: -rwxr-xr-x
+
+# 5. Check SELinux context (if applicable)
+ls -Z /var/www/go-workspace/sdl/sdl_binary
+
+# If SELinux is blocking, fix with:
+sudo chcon -t bin_t /var/www/go-workspace/sdl/sdl_binary
+# OR disable for the binary:
+sudo setenforce 0  # Temporary, for testing only
+
+# 6. Restart service
+sudo systemctl restart sdl.service
+sudo systemctl status sdl.service
+```
+
+**Prevention:**
+```bash
+# When building, set permissions immediately
+go build -o sdl_binary main.go
+chmod +x sdl_binary
+
+# When copying to server, preserve permissions
+scp -p sdl_binary user@server:/path/to/sdl/
+
+# Or in deployment script:
+sudo install -m 755 -o your_user -g your_group sdl_binary /var/www/go-workspace/sdl/
+```
+
+---
+
 ## Troubleshooting
 
 ### Service Won't Start
@@ -671,6 +727,89 @@ db.binlog_offsets.findOne()
 
 // Compare with MySQL: SELECT @@global.gtid_executed;
 ```
+
+---
+
+### Canal Protocol Errors ("invalid sequence")
+
+**Symptoms:**
+```
+Canal error: invalid sequence 0 != 1
+ERROR handle rows event file=mysql-bin.003773 position=1155900
+Service restart counter increasing
+```
+
+**Root Causes:**
+- Network packet loss or corruption
+- Rapid binlog rotations during high load
+- MySQL server overloaded
+- MySQL replication protocol bugs
+
+**Automatic Recovery (Built-in):**
+The service automatically retries up to 10 times with exponential backoff:
+```
+Attempt 1: 2s delay
+Attempt 2: 4s delay
+Attempt 3: 8s delay
+...
+Attempt 10: 60s delay (max)
+```
+
+**What to Check:**
+```bash
+# 1. Check for rapid binlog rotations
+mysql -e "SHOW BINARY LOGS;" | tail -20
+
+# 2. Check MySQL load
+mysqladmin -u root -p processlist | grep -c "Binlog Dump"
+
+# 3. Check network errors
+journalctl -u sdl.service | grep -i "invalid sequence\|connection reset\|broken pipe"
+
+# 4. Monitor retry attempts
+journalctl -u sdl.service -f | grep "Canal retry attempt"
+```
+
+**Manual Intervention (if retries exhausted):**
+```bash
+# 1. Stop service
+sudo systemctl stop sdl.service
+
+# 2. Check MongoDB for last saved position
+mongosh audit << 'EOF'
+db.binlog_offsets.findOne()
+EOF
+
+# 3. Verify MySQL binlog still available
+mysql -e "SHOW BINARY LOGS;" | grep "mysql-bin.XXXXX"
+
+# 4. Restart service (will auto-resume from saved GTID)
+sudo systemctl start sdl.service
+
+# 5. Monitor for successful reconnection
+journalctl -u sdl.service -f
+```
+
+**Prevention:**
+```ini
+# /etc/mysql/mysql.conf.d/mysqld.cnf
+# Increase binlog size to reduce rotation frequency
+max_binlog_size = 512M  # Default: 100M
+
+# Increase network buffer
+max_allowed_packet = 64M
+
+# Tune replication settings
+slave_net_timeout = 60
+```
+
+**If Problem Persists:**
+1. Check MySQL error logs: `sudo tail -f /var/log/mysql/error.log`
+2. Verify network stability: `ping -c 100 mysql-host`
+3. Check MySQL performance: `mysqladmin extended-status | grep -i binlog`
+4. Consider upgrading go-mysql library version
+
+---
 
 ### Batch Stuck in Staging
 
