@@ -864,7 +864,7 @@ func formatEventDetail(event EventDoc) string {
 
 func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()) {
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" Set Filters ").SetTitleAlign(tview.AlignCenter)
+	form.SetBorder(true).SetTitle(" Set Filters (Ctrl+V to paste) ").SetTitleAlign(tview.AlignCenter)
 
 	// Pre-fill with current values
 	dbValue := state.filters.database
@@ -886,19 +886,28 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 		limitValue = "100"
 	}
 
-	form.AddInputField("Database", dbValue, 30, nil, nil)
-	form.AddInputField("Table", tableValue, 30, nil, nil)
-	form.AddInputField("Primary Key", pkValue, 30, nil, nil)
-	form.AddInputField("Start Date (YYYY-MM-DD)", startDateValue, 30, nil, nil)
-	form.AddInputField("End Date (YYYY-MM-DD)", endDateValue, 30, nil, nil)
-	form.AddInputField("Limit", limitValue, 10, nil, nil)
+	// Create input fields with paste-friendly settings
+	dbField := tview.NewInputField().SetLabel("Database: ").SetText(dbValue).SetFieldWidth(30)
+	tableField := tview.NewInputField().SetLabel("Table: ").SetText(tableValue).SetFieldWidth(30)
+	pkField := tview.NewInputField().SetLabel("Primary Key: ").SetText(pkValue).SetFieldWidth(30)
+	startDateField := tview.NewInputField().SetLabel("Start Date (YYYY-MM-DD): ").SetText(startDateValue).SetFieldWidth(30)
+	endDateField := tview.NewInputField().SetLabel("End Date (YYYY-MM-DD): ").SetText(endDateValue).SetFieldWidth(30)
+	limitField := tview.NewInputField().SetLabel("Limit: ").SetText(limitValue).SetFieldWidth(10)
+
+	// Add all fields to form
+	form.AddFormItem(dbField)
+	form.AddFormItem(tableField)
+	form.AddFormItem(pkField)
+	form.AddFormItem(startDateField)
+	form.AddFormItem(endDateField)
+	form.AddFormItem(limitField)
 
 	form.AddButton("Apply", func() {
-		// Get values
-		state.filters.database = form.GetFormItem(0).(*tview.InputField).GetText()
-		state.filters.table = form.GetFormItem(1).(*tview.InputField).GetText()
+		// Get values from fields
+		state.filters.database = dbField.GetText()
+		state.filters.table = tableField.GetText()
 
-		pkStr := form.GetFormItem(2).(*tview.InputField).GetText()
+		pkStr := pkField.GetText()
 		if pkStr != "" {
 			var pkInt int64
 			if _, err := fmt.Sscanf(pkStr, "%d", &pkInt); err == nil {
@@ -910,7 +919,7 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 			state.filters.pk = nil
 		}
 
-		startDateStr := form.GetFormItem(3).(*tview.InputField).GetText()
+		startDateStr := startDateField.GetText()
 		if startDateStr != "" {
 			if t, err := time.Parse("2006-01-02", startDateStr); err == nil {
 				state.filters.startTime = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
@@ -919,7 +928,7 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 			state.filters.startTime = time.Time{}
 		}
 
-		endDateStr := form.GetFormItem(4).(*tview.InputField).GetText()
+		endDateStr := endDateField.GetText()
 		if endDateStr != "" {
 			if t, err := time.Parse("2006-01-02", endDateStr); err == nil {
 				state.filters.endTime = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, time.UTC)
@@ -928,7 +937,7 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 			state.filters.endTime = time.Time{}
 		}
 
-		limitStr := form.GetFormItem(5).(*tview.InputField).GetText()
+		limitStr := limitField.GetText()
 		limit, _ := strconv.ParseInt(limitStr, 10, 64)
 		if limit == 0 {
 			limit = 100
@@ -1014,6 +1023,11 @@ func showHelpDialog(pages *tview.Pages) {
 [green]q/Q[-]    - Quit application
 [green]Enter[-]  - View event details
 [green]ESC[-]    - Close detail/dialog view
+
+[yellow]Input Fields:[-]
+[green]Ctrl+V[-]  - Paste from clipboard (in filter dialog)
+[green]Ctrl+C[-]  - Copy selected text
+- Use Shift+Insert as alternative paste
 
 [yellow]Mouse:[-]
 - Click to select event

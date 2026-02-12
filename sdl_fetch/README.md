@@ -64,11 +64,29 @@ go run script.go
 
 ### 2. Query Audit Logs (fetch.go)
 
-Fetch and analyze the audit logs stored in MongoDB:
+Launch the interactive TUI to view and analyze audit logs:
 
 ```bash
 go run fetch.go
 ```
+
+**TUI Features:**
+- Real-time activity graphs (INS/UPD/DEL per minute)
+- Filter by database, table, primary key, date range
+- Auto-refresh every 1 second (F10 to toggle)
+- Export to CSV/JSON (F9)
+- View detailed event information (Enter on event)
+- **Paste support in input fields** (Ctrl+V or Shift+Insert)
+
+**Keyboard Shortcuts:**
+- `F1` - Set filters
+- `F5` - Refresh data
+- `F9` - Export to file
+- `F10` - Toggle auto-refresh
+- `?` - Help
+- `q` - Quit
+- `Enter` - View event details
+- `ESC` - Close dialog
 
 ## fetch.go Examples
 
