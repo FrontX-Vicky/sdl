@@ -767,9 +767,13 @@ func createMainUI(state *AppState) *tview.Pages {
 				showFilterDialog(state, pages, updateTable)
 				return nil
 			case tcell.KeyF5:
+				showLoadingModal(pages, "Refreshing data...")
 				go func() {
 					state.loadEvents()
-					state.app.QueueUpdateDraw(updateTable)
+					state.app.QueueUpdateDraw(func() {
+						pages.HidePage("loading")
+						updateTable()
+					})
 				}()
 				return nil
 			case tcell.KeyF9:
@@ -863,9 +867,30 @@ func formatEventDetail(event EventDoc) string {
 	return sb.String()
 }
 
+func showLoadingModal(pages *tview.Pages, message string) {
+	loadingText := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter).
+		SetText(fmt.Sprintf("\n\n[yellow]%s[-]\n\n[cyan]Please wait...[-]", message))
+
+	loadingText.SetBorder(true).
+		SetTitle(" Loading ").
+		SetTitleAlign(tview.AlignCenter)
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(loadingText, 7, 1, false).
+			AddItem(nil, 0, 1, false), 40, 1, false).
+		AddItem(nil, 0, 1, false)
+
+	pages.AddPage("loading", modal, true, true)
+}
+
 func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()) {
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" Set Filters (Ctrl+V to paste) ").SetTitleAlign(tview.AlignCenter)
+	form.SetBorder(true).SetTitle(" Set Filters (Right-click or Shift+Insert to paste) ").SetTitleAlign(tview.AlignCenter)
 
 	// Pre-fill with current values
 	dbValue := state.filters.database
@@ -895,20 +920,27 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 	endDateField := tview.NewInputField().SetLabel("End Date (YYYY-MM-DD): ").SetText(endDateValue).SetFieldWidth(30)
 	limitField := tview.NewInputField().SetLabel("Limit: ").SetText(limitValue).SetFieldWidth(10)
 
-	// Enable paste by handling Ctrl+V
+	// Enable paste by handling Ctrl+V and Shift+Insert (for PuTTY)
 	enablePaste := func(field *tview.InputField) {
 		field.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-			// Handle Ctrl+V (or Cmd+V on Mac)
+			// Handle Ctrl+V (Windows Terminal)
 			if event.Key() == tcell.KeyCtrlV || (event.Modifiers()&tcell.ModCtrl != 0 && event.Rune() == 'v') {
-				// Read from clipboard
 				if text, err := clipboard.ReadAll(); err == nil && text != "" {
-					// Get current text and cursor position
 					currentText := field.GetText()
-					// Append pasted text to current text
 					field.SetText(currentText + text)
 				}
-				return nil // Consume the event
+				return nil
 			}
+
+			// Handle Shift+Insert (PuTTY, most terminals)
+			if event.Key() == tcell.KeyInsert && event.Modifiers()&tcell.ModShift != 0 {
+				if text, err := clipboard.ReadAll(); err == nil && text != "" {
+					currentText := field.GetText()
+					field.SetText(currentText + text)
+				}
+				return nil
+			}
+
 			// Allow all other keys to pass through
 			return event
 		})
@@ -972,9 +1004,16 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 		state.filters.limit = limit
 
 		pages.HidePage("filter")
+
+		// Show loading modal
+		showLoadingModal(pages, "Loading events...")
+
 		go func() {
 			state.loadEvents()
-			state.app.QueueUpdateDraw(updateCallback)
+			state.app.QueueUpdateDraw(func() {
+				pages.HidePage("loading")
+				updateCallback()
+			})
 		}()
 	})
 
@@ -1051,10 +1090,11 @@ func showHelpDialog(pages *tview.Pages) {
 [green]Enter[-]  - View event details
 [green]ESC[-]    - Close detail/dialog view
 
-[yellow]Input Fields:[-]
-[green]Ctrl+V[-]  - Paste from clipboard (in filter dialog)
-[green]Ctrl+C[-]  - Copy selected text
-- Use Shift+Insert as alternative paste
+[yellow]Input Fields (in filter dialog):[-]
+[green]Right-click[-] - Paste from clipboard (PuTTY)
+[green]Shift+Insert[-] - Paste from clipboard
+[green]Ctrl+V[-] - Paste (Windows Terminal)
+- Simply type or paste text into fields
 
 [yellow]Mouse:[-]
 - Click to select event
