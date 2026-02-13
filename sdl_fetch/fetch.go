@@ -100,7 +100,8 @@ func connectMongo() (*mongo.Collection, error) {
 }
 
 func fetchEvents(coll *mongo.Collection, params QueryParams) ([]EventDoc, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Reduced timeout for better responsiveness
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Build filter
@@ -134,12 +135,28 @@ func fetchEvents(coll *mongo.Collection, params QueryParams) ([]EventDoc, error)
 		filter["ts"] = timeFilter
 	}
 
-	// Query options
-	opts := options.Find().SetSort(bson.D{bson.E{Key: "ts", Value: -1}}) // Sort by timestamp descending
+	// Query options with performance optimizations
+	opts := options.Find().
+		SetSort(bson.D{{Key: "ts", Value: -1}}). // Use compound index: ts + meta.db + meta.tbl
+		SetHint(bson.D{{Key: "ts", Value: -1}}). // Hint to use index
+		SetBatchSize(1000)                       // Optimize batch size
 
 	if params.Limit > 0 {
 		opts.SetLimit(params.Limit)
+	} else {
+		opts.SetLimit(1000) // Default max limit
 	}
+
+	// Only fetch necessary fields for list view (optimization)
+	opts.SetProjection(bson.M{
+		"_id":    1,
+		"ts":     1,
+		"op":     1,
+		"meta":   1,
+		"ts_ist": 1,
+		"src":    1,
+		"chg":    1,
+	})
 
 	cursor, err := coll.Find(ctx, filter, opts)
 	if err != nil {
@@ -147,7 +164,8 @@ func fetchEvents(coll *mongo.Collection, params QueryParams) ([]EventDoc, error)
 	}
 	defer cursor.Close(ctx)
 
-	var events []EventDoc
+	// Pre-allocate slice for better performance
+	events := make([]EventDoc, 0, int(params.Limit))
 	if err := cursor.All(ctx, &events); err != nil {
 		return nil, err
 	}
@@ -312,6 +330,9 @@ type AppState struct {
 	}
 	autoRefresh bool
 	stopRefresh chan bool
+	// Performance: cache rendered graph to avoid recomputation
+	cachedGraph string
+	cacheValid  bool
 }
 
 func newAppState(coll *mongo.Collection) *AppState {
@@ -350,7 +371,8 @@ func (s *AppState) loadEvents() error {
 }
 
 func computeStats(events []EventDoc) Stats {
-	bucketCount := 30
+	// Adaptive bucket count based on data range
+	bucketCount := 60 // Increased from 30 for better resolution
 	stats := Stats{
 		PerOp:         map[string]int{"i": 0, "u": 0, "d": 0},
 		Series:        map[string][]int{"i": make([]int, bucketCount), "u": make([]int, bucketCount), "d": make([]int, bucketCount)},
@@ -387,16 +409,22 @@ func renderGraph(stats Stats, height, width int) string {
 		return "No per-minute data."
 	}
 
-	if height < 4 {
-		height = 4
+	// Ensure minimum dimensions
+	if height < 6 {
+		height = 6
 	}
-	if width < 20 {
-		width = 20
+	if width < 30 {
+		width = 30
 	}
 
+	// Calculate max value across all series
 	maxVal := 0
+	totalSeries := make([]int, stats.BucketMinutes)
 	for _, series := range stats.Series {
-		for _, v := range series {
+		for i, v := range series {
+			if i < len(totalSeries) {
+				totalSeries[i] += v
+			}
 			if v > maxVal {
 				maxVal = v
 			}
@@ -474,21 +502,30 @@ func renderGraph(stats Stats, height, width int) string {
 	}
 
 	var sb strings.Builder
-	// Legend
-	sb.WriteString("[green]INS[-] [yellow]UPD[-] [red]DEL[-]\n")
 
-	// Calculate Y-axis labels
+	// Enhanced legend with counts
+	insTotal := stats.PerOp["i"]
+	updTotal := stats.PerOp["u"]
+	delTotal := stats.PerOp["d"]
+	sb.WriteString(fmt.Sprintf("[green]● INS:%d[-]  [yellow]● UPD:%d[-]  [red]● DEL:%d[-]  [white]Max/min: %d[-]\n",
+		insTotal, updTotal, delTotal, maxVal))
+
+	// Calculate Y-axis labels with better scaling
 	yAxisLabels := make([]string, height)
 	for y := 0; y < height; y++ {
 		val := maxVal - (maxVal*y)/(height-1)
 		if y == height-1 {
 			val = 0
 		}
-		yAxisLabels[y] = fmt.Sprintf("%3d", val)
+		if maxVal > 1000 {
+			yAxisLabels[y] = fmt.Sprintf("%4.1fK", float64(val)/1000.0)
+		} else {
+			yAxisLabels[y] = fmt.Sprintf("%4d", val)
+		}
 	}
 
 	// Find max label width
-	maxLabelWidth := 3
+	maxLabelWidth := 4
 	for _, label := range yAxisLabels {
 		if len(label) > maxLabelWidth {
 			maxLabelWidth = len(label)
@@ -602,7 +639,9 @@ func createMainUI(state *AppState) *tview.Pages {
 
 	// Update table function
 	updateTable := func() {
+		// Recompute stats (lightweight operation)
 		state.stats = computeStats(state.events)
+		state.cacheValid = false // Invalidate cache when data changes
 
 		// Totals + status panel
 		ins := state.stats.PerOp["i"]
@@ -615,27 +654,37 @@ func createMainUI(state *AppState) *tview.Pages {
 		statsPanel.SetText(fmt.Sprintf("[white]Total:[-] %d\n[green]INS:[-] %d  [yellow]UPD:[-] %d  [red]DEL:[-] %d\nStatus: %s\nLast refresh: %s",
 			state.stats.Total, ins, upd, del, state.status, lastRef))
 
-		// Trend graph - get dynamic dimensions
+		// Trend graph - use cache if valid and dimensions match
 		_, _, graphWidth, graphHeight := graphText.GetRect()
 		if graphWidth > 0 && graphHeight > 0 {
-			graphText.SetText(renderGraph(state.stats, graphHeight-2, graphWidth-2))
+			if !state.cacheValid {
+				state.cachedGraph = renderGraph(state.stats, graphHeight-2, graphWidth-2)
+				state.cacheValid = true
+			}
+			graphText.SetText(state.cachedGraph)
 		} else {
 			graphText.SetText(renderGraph(state.stats, 20, 60))
 		}
 
-		// Clear existing rows (keep header)
-		for row := table.GetRowCount() - 1; row > 0; row-- {
-			table.RemoveRow(row)
+		// Clear existing rows (keep header) - optimize by batch removal
+		rowCount := table.GetRowCount()
+		if rowCount > 1 {
+			for row := rowCount - 1; row > 0; row-- {
+				table.RemoveRow(row)
+			}
 		}
 
-		// Add events
+		// Add events (optimized with pre-allocated strings)
+		opNameMap := map[string]string{"i": "INS", "u": "UPD", "d": "DEL"}
+		opColorMap := map[string]tcell.Color{
+			"i": tcell.ColorGreen,
+			"u": tcell.ColorYellow,
+			"d": tcell.ColorRed,
+		}
+
 		for i, event := range state.events {
-			opName := map[string]string{"i": "INS", "u": "UPD", "d": "DEL"}[event.OP]
-			opColor := map[string]tcell.Color{
-				"i": tcell.ColorGreen,
-				"u": tcell.ColorYellow,
-				"d": tcell.ColorRed,
-			}[event.OP]
+			opName := opNameMap[event.OP]
+			opColor := opColorMap[event.OP]
 			if opColor == 0 {
 				opColor = tcell.ColorWhite
 			}

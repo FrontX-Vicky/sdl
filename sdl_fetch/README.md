@@ -71,12 +71,22 @@ go run fetch.go
 ```
 
 **TUI Features:**
-- Real-time activity graphs (INS/UPD/DEL per minute)
-- Filter by database, table, primary key, date range
-- Auto-refresh every 1 second (F10 to toggle)
-- Export to CSV/JSON (F9)
-- View detailed event information (Enter on event)
-- **Paste support in input fields** (Ctrl+V or Shift+Insert)
+- **Real-time activity graphs** (60-minute window, INS/UPD/DEL per minute)
+- **Advanced filtering** by database, table, primary key, date range
+- **Auto-refresh** every 1 second (F10 to toggle)
+- **Export** to CSV/JSON (F9)
+- **Event details** view (Enter on event)
+- **Paste support** in input fields (Ctrl+V, Shift+Insert, Right-click)
+- **Loading indicators** for better UX
+- **Optimized queries** with MongoDB index hints
+- **Graph caching** for smooth performance
+
+**Performance:**
+- Queries optimized with proper indexes (see PERFORMANCE_INDEXES.md)
+- Batch retrieval (1000 docs at a time)
+- Field projection to minimize data transfer
+- Cached graph rendering for smooth UI
+- 30-second query timeout for responsiveness
 
 **Keyboard Shortcuts:**
 - `F1` - Set filters
