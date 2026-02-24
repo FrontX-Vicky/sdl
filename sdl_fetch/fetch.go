@@ -79,15 +79,17 @@ func connectMongo() (*mongo.Collection, error) {
 
 	log.Printf("Connecting to MongoDB %s (db=%s coll=%s)...", mongoURI, mongoDB, mongoColl)
 
-	// Keep startup snappy so the UI doesn't appear to hang when MongoDB is down.
-	connectTimeout := 5 * time.Second
+	// Longer timeout for initial connection (10 seconds) to allow for network issues
+	connectTimeout := 10 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 
 	client, err := mongo.Connect(ctx, options.Client().
 		ApplyURI(mongoURI).
 		SetServerSelectionTimeout(connectTimeout).
-		SetConnectTimeout(connectTimeout))
+		SetConnectTimeout(connectTimeout).
+		SetSocketTimeout(30*time.Second).
+		SetMaxConnIdleTime(5*time.Minute))
 	if err != nil {
 		return nil, fmt.Errorf("MongoDB connection failed: %v", err)
 	}
@@ -100,8 +102,8 @@ func connectMongo() (*mongo.Collection, error) {
 }
 
 func fetchEvents(coll *mongo.Collection, params QueryParams) ([]EventDoc, error) {
-	// Reduced timeout for better responsiveness
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Increased timeout for large datasets (5 minutes)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Build filter
@@ -137,9 +139,8 @@ func fetchEvents(coll *mongo.Collection, params QueryParams) ([]EventDoc, error)
 
 	// Query options with performance optimizations
 	opts := options.Find().
-		SetSort(bson.D{{Key: "ts", Value: -1}}). // Use compound index: ts + meta.db + meta.tbl
-		SetHint(bson.D{{Key: "ts", Value: -1}}). // Hint to use index
-		SetBatchSize(1000)                       // Optimize batch size
+		SetSort(bson.D{{Key: "ts", Value: -1}}). // Sort by timestamp descending
+		SetBatchSize(5000)                       // Larger batch size for better performance with large datasets
 
 	if params.Limit > 0 {
 		opts.SetLimit(params.Limit)
@@ -160,14 +161,80 @@ func fetchEvents(coll *mongo.Collection, params QueryParams) ([]EventDoc, error)
 
 	cursor, err := coll.Find(ctx, filter, opts)
 	if err != nil {
-		return nil, err
+		return []EventDoc{}, err // Return empty slice instead of nil
 	}
 	defer cursor.Close(ctx)
 
 	// Pre-allocate slice for better performance
 	events := make([]EventDoc, 0, int(params.Limit))
 	if err := cursor.All(ctx, &events); err != nil {
-		return nil, err
+		return []EventDoc{}, err // Return empty slice instead of nil
+	}
+
+	return events, nil
+}
+
+func fetchEventsBatch(coll *mongo.Collection, params QueryParams, skip int64, batchSize int) ([]EventDoc, error) {
+	// 30 second timeout per batch (should be quick)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Build filter
+	filter := bson.M{}
+
+	if params.Database != "" {
+		filter["meta.db"] = params.Database
+	}
+
+	if params.Table != "" {
+		filter["meta.tbl"] = params.Table
+	}
+
+	if params.PK != nil {
+		filter["meta.pk"] = params.PK
+	}
+
+	if params.Operation != "" {
+		filter["op"] = params.Operation
+	}
+
+	// Time range filter
+	if !params.StartTime.IsZero() || !params.EndTime.IsZero() {
+		timeFilter := bson.M{}
+		if !params.StartTime.IsZero() {
+			timeFilter["$gte"] = params.StartTime
+		}
+		if !params.EndTime.IsZero() {
+			timeFilter["$lte"] = params.EndTime
+		}
+		filter["ts"] = timeFilter
+	}
+
+	// Query options
+	opts := options.Find().
+		SetSort(bson.D{{Key: "ts", Value: -1}}).
+		SetSkip(skip).
+		SetLimit(int64(batchSize)).
+		SetBatchSize(int32(batchSize)).
+		SetProjection(bson.M{
+			"_id":    1,
+			"ts":     1,
+			"op":     1,
+			"meta":   1,
+			"ts_ist": 1,
+			"src":    1,
+			"chg":    1,
+		})
+
+	cursor, err := coll.Find(ctx, filter, opts)
+	if err != nil {
+		return []EventDoc{}, err
+	}
+	defer cursor.Close(ctx)
+
+	events := make([]EventDoc, 0, batchSize)
+	if err := cursor.All(ctx, &events); err != nil {
+		return []EventDoc{}, err
 	}
 
 	return events, nil
@@ -333,15 +400,21 @@ type AppState struct {
 	// Performance: cache rendered graph to avoid recomputation
 	cachedGraph string
 	cacheValid  bool
+	// Batch loading
+	isLoadingMore bool
+	stopBatchLoad chan bool
+	currentBatch  int
+	totalFetched  int
 }
 
 func newAppState(coll *mongo.Collection) *AppState {
 	state := &AppState{
-		coll:        coll,
-		events:      []EventDoc{},
-		autoRefresh: false,
-		stopRefresh: make(chan bool, 1),
-		status:      "Idle",
+		coll:          coll,
+		events:        []EventDoc{},
+		autoRefresh:   false,
+		stopRefresh:   make(chan bool, 1),
+		stopBatchLoad: make(chan bool, 1),
+		status:        "Idle",
 	}
 	state.filters.limit = 100
 	return state
@@ -574,6 +647,66 @@ func renderGraph(stats Stats, height, width int) string {
 	return sb.String()
 }
 
+func loadBatchesLoop(state *AppState, updateCallback func()) {
+	batchSize := 10
+
+	for {
+		// Check if we should stop (non-blocking check)
+		select {
+		case <-state.stopBatchLoad:
+			state.isLoadingMore = false
+			state.status = "Stopped"
+			state.app.QueueUpdateDraw(updateCallback)
+			return
+		default:
+		}
+
+		// Check if we've reached the limit
+		if state.filters.limit > 0 && int64(state.totalFetched) >= state.filters.limit {
+			state.isLoadingMore = false
+			state.status = fmt.Sprintf("Loaded %d results (limit reached)", state.totalFetched)
+			state.app.QueueUpdateDraw(updateCallback)
+			return
+		}
+
+		params := QueryParams{
+			Database:  state.filters.database,
+			Table:     state.filters.table,
+			PK:        state.filters.pk,
+			StartTime: state.filters.startTime,
+			EndTime:   state.filters.endTime,
+			Limit:     int64(state.filters.limit),
+		}
+
+		skip := int64(state.totalFetched)
+		batch, err := fetchEventsBatch(state.coll, params, skip, batchSize)
+
+		if err != nil || len(batch) == 0 {
+			state.isLoadingMore = false
+			if state.totalFetched == 0 {
+				state.status = "No results found"
+			} else {
+				state.status = fmt.Sprintf("Loaded %d results", state.totalFetched)
+			}
+			state.app.QueueUpdateDraw(updateCallback)
+			return
+		}
+
+		// Append batch to events
+		state.events = append(state.events, batch...)
+		state.totalFetched += len(batch)
+		state.currentBatch++
+		state.status = fmt.Sprintf("Loading... %d loaded", state.totalFetched)
+		state.cacheValid = false
+
+		// Update UI with new batch
+		state.app.QueueUpdateDraw(updateCallback)
+
+		// Sleep briefly to avoid hammering the server
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func createMainUI(state *AppState) *tview.Pages {
 	pages := tview.NewPages()
 
@@ -736,6 +869,9 @@ func createMainUI(state *AppState) *tview.Pages {
 		// Scroll table to top to show newest entries
 		if len(state.events) > 0 {
 			table.Select(1, 0)
+		} else {
+			// Show placeholder message when no data
+			table.SetCell(1, 0, tview.NewTableCell("[yellow]No results - Press F1 to search[-]").SetSelectable(false))
 		}
 
 		// Update stats
@@ -787,14 +923,117 @@ func createMainUI(state *AppState) *tview.Pages {
 		}
 	})
 
+	// Create quick search form panel (left side)
+	searchForm := tview.NewForm()
+	searchForm.SetBorder(true).SetTitle(" Quick Search ").SetTitleAlign(tview.AlignCenter)
+
+	dbField := tview.NewInputField().SetLabel("DB: ").SetFieldWidth(12)
+	tblField := tview.NewInputField().SetLabel("Table: ").SetFieldWidth(12)
+	pkField := tview.NewInputField().SetLabel("PK: ").SetFieldWidth(12)
+	startDateField := tview.NewInputField().SetLabel("From: ").SetFieldWidth(12)
+	endDateField := tview.NewInputField().SetLabel("To: ").SetFieldWidth(12)
+	limitField := tview.NewInputField().SetLabel("Limit: ").SetText("1000").SetFieldWidth(8)
+
+	searchForm.AddFormItem(dbField)
+	searchForm.AddFormItem(tblField)
+	searchForm.AddFormItem(pkField)
+	searchForm.AddFormItem(startDateField)
+	searchForm.AddFormItem(endDateField)
+	searchForm.AddFormItem(limitField)
+
+	searchForm.AddButton("Search", func() {
+		state.filters.database = dbField.GetText()
+		state.filters.table = tblField.GetText()
+
+		pkStr := pkField.GetText()
+		if pkStr != "" {
+			var pkInt int64
+			if _, err := fmt.Sscanf(pkStr, "%d", &pkInt); err == nil {
+				state.filters.pk = pkInt
+			} else {
+				state.filters.pk = pkStr
+			}
+		} else {
+			state.filters.pk = nil
+		}
+
+		startDateStr := startDateField.GetText()
+		if startDateStr != "" {
+			if t, err := time.Parse("2006-01-02", startDateStr); err == nil {
+				state.filters.startTime = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+			}
+		} else {
+			state.filters.startTime = time.Time{}
+		}
+
+		endDateStr := endDateField.GetText()
+		if endDateStr != "" {
+			if t, err := time.Parse("2006-01-02", endDateStr); err == nil {
+				state.filters.endTime = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, time.UTC)
+			}
+		} else {
+			state.filters.endTime = time.Time{}
+		}
+
+		limitStr := limitField.GetText()
+		limit, _ := strconv.ParseInt(limitStr, 10, 64)
+		if limit == 0 {
+			limit = 1000
+		}
+		state.filters.limit = limit
+
+		// Start batch loading
+		state.events = []EventDoc{}
+		state.currentBatch = 0
+		state.totalFetched = 0
+		state.isLoadingMore = true
+		state.status = "Loading..."
+		state.cacheValid = false
+		updateTable()
+
+		go loadBatchesLoop(state, updateTable)
+	})
+	searchForm.AddButton("Stop", func() {
+		if state.isLoadingMore {
+			state.stopBatchLoad <- true
+			state.isLoadingMore = false
+			state.status = "Search stopped"
+			state.cacheValid = false
+			updateTable()
+		}
+	})
+	searchForm.AddButton("Clear", func() {
+		dbField.SetText("")
+		tblField.SetText("")
+		pkField.SetText("")
+		startDateField.SetText("")
+		endDateField.SetText("")
+		limitField.SetText("1000")
+		state.filters.database = ""
+		state.filters.table = ""
+		state.filters.pk = nil
+		state.filters.startTime = time.Time{}
+		state.filters.endTime = time.Time{}
+		state.filters.limit = 1000
+		state.events = []EventDoc{}
+		state.currentBatch = 0
+		state.totalFetched = 0
+		state.isLoadingMore = false
+		state.cacheValid = false
+		updateTable()
+	})
+
 	// Assemble main view
 	mainFlex.
 		AddItem(header, 1, 0, false).
 		AddItem(filterText, 1, 0, false).
 		AddItem(tview.NewFlex().
 			SetDirection(tview.FlexColumn).
-			AddItem(graphText, 0, 7, false).
-			AddItem(statsPanel, 0, 2, false), 0, 5, false). // larger top section (~55-65%)
+			AddItem(searchForm, 0, 3, true).
+			AddItem(tview.NewFlex().
+				SetDirection(tview.FlexRow).
+				AddItem(graphText, 0, 1, false).
+				AddItem(statsPanel, 0, 1, false), 0, 6, false), 0, 5, false).
 		AddItem(table, 0, 5, true).
 		AddItem(statsText, 1, 0, false)
 
@@ -816,14 +1055,15 @@ func createMainUI(state *AppState) *tview.Pages {
 				showFilterDialog(state, pages, updateTable)
 				return nil
 			case tcell.KeyF5:
-				showLoadingModal(pages, "Refreshing data...")
-				go func() {
-					state.loadEvents()
-					state.app.QueueUpdateDraw(func() {
-						pages.HidePage("loading")
-						updateTable()
-					})
-				}()
+				// Start batch loading with current filters
+				state.events = []EventDoc{}
+				state.currentBatch = 0
+				state.totalFetched = 0
+				state.isLoadingMore = true
+				state.status = "Loading..."
+				state.cacheValid = false
+				updateTable()
+				go loadBatchesLoop(state, updateTable)
 				return nil
 			case tcell.KeyF9:
 				showExportDialog(state, pages)
@@ -1054,16 +1294,16 @@ func showFilterDialog(state *AppState, pages *tview.Pages, updateCallback func()
 
 		pages.HidePage("filter")
 
-		// Show loading modal
-		showLoadingModal(pages, "Loading events...")
+		// Start batch loading instead of loading all at once
+		state.events = []EventDoc{}
+		state.currentBatch = 0
+		state.totalFetched = 0
+		state.isLoadingMore = true
+		state.status = "Loading..."
+		state.cacheValid = false
 
-		go func() {
-			state.loadEvents()
-			state.app.QueueUpdateDraw(func() {
-				pages.HidePage("loading")
-				updateCallback()
-			})
-		}()
+		updateCallback()
+		go loadBatchesLoop(state, updateCallback)
 	})
 
 	form.AddButton("Cancel", func() {
@@ -1200,7 +1440,9 @@ func autoRefreshLoop(state *AppState, updateCallback func()) {
 				return
 			}
 			if err := state.loadEvents(); err != nil {
-				state.status = fmt.Sprintf("[red]Auto-refresh failed: %v[-]", err)
+				state.status = "[red]Auto-refresh failed[-]"
+			} else {
+				state.status = fmt.Sprintf("[green]Connected (%d events)[-]", len(state.events))
 			}
 			state.app.QueueUpdateDraw(updateCallback)
 		case <-state.stopRefresh:
@@ -1222,42 +1464,23 @@ func main() {
 
 	pages := createMainUI(state)
 
-	// Connect to MongoDB in the background so the UI always appears.
+	// Connect to MongoDB in the background
 	state.status = "Connecting to MongoDB..."
 	go func() {
 		coll, err := connectMongo()
 		if err != nil {
 			state.app.QueueUpdateDraw(func() {
-				state.status = fmt.Sprintf("[red]MongoDB connect failed: %v[-]", err)
+				state.status = "[red]MongoDB connection failed - Check config[-]"
 				if state.refreshUI != nil {
 					state.refreshUI()
 				}
-				showMessageDialog(pages, fmt.Sprintf("MongoDB connection failed:\n%v\n\nCheck MONGO_URI/MONGO_DB/MONGO_COLL and ensure MongoDB is running.", err))
 			})
 			return
 		}
 
 		state.coll = coll
-		state.status = "Connected. Loading events..."
+		state.status = "[green]Connected[-] | [yellow]Press F1 to search[-]"
 		state.app.QueueUpdateDraw(func() {
-			if state.refreshUI != nil {
-				state.refreshUI()
-			}
-		})
-
-		if err := state.loadEvents(); err != nil {
-			state.app.QueueUpdateDraw(func() {
-				state.status = fmt.Sprintf("[red]Load error: %v[-]", err)
-				if state.refreshUI != nil {
-					state.refreshUI()
-				}
-				showMessageDialog(pages, fmt.Sprintf("Failed to load events:\n%v", err))
-			})
-			return
-		}
-
-		state.app.QueueUpdateDraw(func() {
-			state.status = fmt.Sprintf("Connected (%d events)", len(state.events))
 			if state.refreshUI != nil {
 				state.refreshUI()
 			}
