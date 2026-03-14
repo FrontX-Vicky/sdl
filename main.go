@@ -118,14 +118,10 @@ func retryWithBackoff(ctx context.Context, fn func(context.Context) error, maxRe
 
 		// If we've exhausted retries or it's not transient, return error
 		if attempt >= maxRetries || !isTransient {
-			if isTransient {
-				log.Printf("Max retries exceeded for transient error: %v", lastErr)
-			}
 			return lastErr
 		}
 
 		// Wait before retrying
-		log.Printf("Transient error (attempt %d/%d), retrying in %v: %v", attempt+1, maxRetries, delay, err)
 		select {
 		case <-time.After(delay):
 			// Continue to next retry
@@ -206,11 +202,7 @@ func (s *MongoSink) writeBatchWithGTID(ctx context.Context, docs []EventDoc, sou
 			if strings.Contains(errStr, "Transaction numbers are only allowed on a replica set") ||
 				strings.Contains(errStr, "Cannot insert into a time-series collection in a multi-document transaction") {
 				// Fallback: write without transaction (WARNING: not atomic, but works)
-				// Log warning only once to avoid spam
-				if !s.noTxWarningLogged {
-					log.Println("WARNING: MongoDB transactions not supported (standalone or time-series collection), using non-transactional writes. Data safety reduced.")
-					s.noTxWarningLogged = true
-				}
+				// Keep functionality; suppress non-error logging
 				err = s.writeBatchWithoutTransaction(retryCtx, docs, source, gtid, file, pos)
 				if err != nil {
 					return fmt.Errorf("write batch (non-transactional fallback): %w", err)
@@ -380,9 +372,7 @@ func (s *MongoSink) RecoverPendingBatches(ctx context.Context) error {
 	}
 
 	if len(stagingDocs) > 0 {
-		log.Printf("Found %d pending batches to recover", len(stagingDocs))
 		for _, doc := range stagingDocs {
-			log.Printf("Recovering batch %v", doc["_id"])
 			// Mark as archived (don't re-process)
 			_, _ = s.staging.UpdateByID(ctx, doc["_id"], bson.M{
 				"$set": bson.M{
@@ -424,7 +414,6 @@ func (h *Handler) Flush(ctx context.Context) error {
 	if len(h.batch) == 0 {
 		return nil
 	}
-	log.Printf("Flushing %d remaining events", len(h.batch))
 	if err := h.sink.writeBatchWithGTID(ctx, h.batch, h.source, h.batchGTID, h.batchFile, h.batchPos); err != nil {
 		return fmt.Errorf("flush batch: %w", err)
 	}
@@ -619,7 +608,6 @@ func (h *Handler) OnRotate(header *replication.EventHeader, ev *replication.Rota
 func (h *Handler) OnTableChanged(header *replication.EventHeader, schema, table string) error {
 	key := fmt.Sprintf("%s.%s", schema, table)
 	delete(h.tableSchemas, key)
-	log.Printf("Schema change detected: %s - flushing batch for safety", key)
 	// Flush current batch to ensure consistency
 	if err := h.Flush(context.Background()); err != nil {
 		log.Printf("Error flushing on schema change: %v", err)
@@ -656,24 +644,22 @@ func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetrie
 			if delay > 60*time.Second {
 				delay = 60 * time.Second
 			}
-			log.Printf("Canal retry attempt %d/%d after %v (previous error: %v)", attempt+1, maxRetries, delay, lastErr)
 			time.Sleep(delay)
 		}
 
 		// Load position from MongoDB
 		gtidStr, ok, err := sink.loadGTID(context.Background(), source)
 		if err != nil {
-			log.Printf("Warning: Could not load GTID from MongoDB: %v", err)
+			log.Printf("Error: Could not load GTID from MongoDB: %v", err)
 		}
 
 		// Start Canal from saved position or master's current position
 		if ok && gtidStr != "" {
 			gtidSet, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtidStr)
 			if err != nil {
-				log.Printf("Warning: Could not parse saved GTID '%s': %v, falling back to master position", gtidStr, err)
+				log.Printf("Error: Could not parse saved GTID '%s': %v, falling back to master position", gtidStr, err)
 				ok = false
 			} else {
-				log.Printf("Resuming from saved GTID: %s (attempt %d/%d)", gtidStr, attempt+1, maxRetries)
 				if err := c.StartFromGTID(gtidSet); err != nil {
 					lastErr = fmt.Errorf("start from GTID: %w", err)
 					continue
@@ -688,7 +674,6 @@ func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetrie
 				lastErr = fmt.Errorf("get master GTID: %w", err)
 				continue
 			}
-			log.Printf("Starting from master's GTID set: %s (attempt %d/%d)", gset.String(), attempt+1, maxRetries)
 			if err := c.StartFromGTID(gset); err != nil {
 				lastErr = fmt.Errorf("start from master GTID: %w", err)
 				continue
@@ -696,7 +681,6 @@ func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetrie
 		}
 
 		// Run Canal - this blocks until error or stopped
-		log.Printf("Canal running (attempt %d/%d)...", attempt+1, maxRetries)
 		err = c.Run()
 
 		if err == nil {
@@ -715,21 +699,16 @@ func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetrie
 			strings.Contains(errStr, "i/o timeout")
 
 		if !isRecoverable {
-			log.Printf("Non-recoverable Canal error: %v", err)
 			return err
 		}
 
-		log.Printf("Recoverable Canal error detected: %v", err)
-
 		// Close the Canal instance to reset connection
-		log.Println("Closing Canal connection for reconnection...")
 		c.Close()
 
 		// Brief pause before retry
 		time.Sleep(1 * time.Second)
 	}
 
-	log.Printf("Max Canal retries (%d) exceeded, last error: %v", maxRetries, lastErr)
 	return fmt.Errorf("canal retry exhausted after %d attempts: %w", maxRetries, lastErr)
 }
 
@@ -795,7 +774,7 @@ func main() {
 	go func() {
 		// Recover any pending batches from previous crash
 		if err := sink.RecoverPendingBatches(context.Background()); err != nil {
-			log.Printf("Warning: Could not recover pending batches: %v", err)
+			log.Printf("Error: Could not recover pending batches: %v", err)
 			// Don't fail startup, continue with replication
 		}
 
@@ -810,8 +789,7 @@ func main() {
 	// Wait for signal or error
 	select {
 	case sig := <-sigChan:
-		log.Printf("Received signal: %v", sig)
-		log.Println("Initiating graceful shutdown...")
+		_ = sig
 
 		// Stop canal from accepting new events
 		c.Close()
@@ -827,8 +805,6 @@ func main() {
 		if err := sink.client.Disconnect(context.Background()); err != nil {
 			log.Printf("Error closing MongoDB: %v", err)
 		}
-
-		log.Println("Shutdown complete")
 		os.Exit(0)
 
 	case err := <-errChan:
