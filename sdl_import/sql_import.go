@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,6 +117,67 @@ func detectTableColumnsMySQL(db *sql.DB, dbName string) map[string]map[string]bo
 	return result
 }
 
+func detectTableColumnOrderMySQL(db *sql.DB, dbName string) map[string][]string {
+	result := make(map[string][]string)
+	rows, err := db.Query(
+		`SELECT TABLE_NAME, COLUMN_NAME
+		 FROM information_schema.columns
+		 WHERE TABLE_SCHEMA = ?
+		 ORDER BY TABLE_NAME, ORDINAL_POSITION`, dbName)
+	if err != nil {
+		log.Printf("WARNING: Cannot query info_schema for ordered columns: %v", err)
+		return result
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tbl, col string
+		if err := rows.Scan(&tbl, &col); err != nil {
+			continue
+		}
+		result[tbl] = append(result[tbl], col)
+	}
+	return result
+}
+
+type columnMeta struct {
+	IsNullable bool
+	HasDefault bool
+	DefaultVal string
+	DataType   string
+	Extra      string
+}
+
+func detectColumnMetaMySQL(db *sql.DB, dbName string) map[string]map[string]columnMeta {
+	result := make(map[string]map[string]columnMeta)
+	rows, err := db.Query(
+		`SELECT TABLE_NAME, COLUMN_NAME, IS_NULLABLE, COLUMN_DEFAULT, DATA_TYPE, EXTRA
+		 FROM information_schema.columns
+		 WHERE TABLE_SCHEMA = ?`, dbName)
+	if err != nil {
+		log.Printf("WARNING: Cannot query info_schema for column metadata: %v", err)
+		return result
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tbl, col, isNullable, dataType, extra string
+		var def sql.NullString
+		if err := rows.Scan(&tbl, &col, &isNullable, &def, &dataType, &extra); err != nil {
+			continue
+		}
+		if result[tbl] == nil {
+			result[tbl] = make(map[string]columnMeta)
+		}
+		result[tbl][col] = columnMeta{
+			IsNullable: strings.EqualFold(isNullable, "YES"),
+			HasDefault: def.Valid,
+			DefaultVal: def.String,
+			DataType:   strings.ToLower(dataType),
+			Extra:      strings.ToLower(extra),
+		}
+	}
+	return result
+}
+
 func detectExistingTables(db *sql.DB, dbName string) map[string]bool {
 	result := make(map[string]bool)
 	rows, err := db.Query(
@@ -136,9 +198,47 @@ func detectExistingTables(db *sql.DB, dbName string) map[string]bool {
 
 // ─── SQL parsing ───
 
-// reInsertHeader matches: INSERT INTO `table` (`col1`, `col2`, ...) VALUES
-// Works for both multi-line (VALUES at end) and single-line (VALUES followed by data)
-var reInsertHeader = regexp.MustCompile("^INSERT INTO `([^`]+)` \\(([^)]+)\\) VALUES\\s*(.*)$")
+// reInsertHeader matches both:
+// 1) INSERT INTO `table` (`col1`, `col2`) VALUES ...
+// 2) INSERT INTO `table` VALUES ...
+// and db-qualified variants: INSERT INTO `db`.`table` ...
+var reInsertHeader = regexp.MustCompile(`(?i)^INSERT INTO\s+` + "`" + `(?:([^` + "`" + `]+)` + "`" + `\.)?([^` + "`" + `]+)` + "`" + `(?:\s*\(([^)]*)\))?\s+VALUES\s*(.*)$`)
+
+// reUseDB matches: USE `db`; or USE db;
+var reUseDB = regexp.MustCompile(`(?i)^USE\s+` + "`" + `?([^` + "`" + `\s;]+)` + "`" + `?\s*;?\s*$`)
+
+type insertHeader struct {
+	sourceDB   string
+	table      string
+	columns    []string
+	hasColumns bool
+	trailing   string
+}
+
+func parseInsertHeader(line string) (insertHeader, bool) {
+	m := reInsertHeader.FindStringSubmatch(strings.TrimSpace(line))
+	if m == nil {
+		return insertHeader{}, false
+	}
+	h := insertHeader{
+		sourceDB: strings.TrimSpace(m[1]),
+		table:    strings.TrimSpace(m[2]),
+		trailing: strings.TrimSpace(m[4]),
+	}
+	if strings.TrimSpace(m[3]) != "" {
+		h.columns = parseColumnList(m[3])
+		h.hasColumns = true
+	}
+	return h, true
+}
+
+func parseUseDB(line string) string {
+	m := reUseDB.FindStringSubmatch(strings.TrimSpace(line))
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
 
 // parseColumnList extracts column names from "`col1`, `col2`, ..."
 func parseColumnList(raw string) []string {
@@ -253,13 +353,90 @@ func extractTuples(data string) []string {
 	return tuples
 }
 
+func escapeSQLLiteralImport(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "'", "\\'")
+	s = strings.ReplaceAll(s, "\x00", "\\0")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "\x1a", "\\Z")
+	return s
+}
+
+func isNumericTypeImport(t string) bool {
+	switch t {
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "decimal", "numeric", "float", "double", "real", "bit", "bool", "boolean":
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultLiteralImport(meta columnMeta) string {
+	if meta.HasDefault {
+		d := strings.TrimSpace(meta.DefaultVal)
+		if strings.EqualFold(d, "NULL") {
+			return ""
+		}
+		ld := strings.ToLower(d)
+		if strings.HasPrefix(ld, "current_timestamp") || strings.HasPrefix(ld, "now()") || strings.HasPrefix(ld, "uuid()") {
+			return d
+		}
+		if isNumericTypeImport(meta.DataType) {
+			if _, err := strconv.ParseFloat(d, 64); err == nil {
+				return d
+			}
+		}
+		return "'" + escapeSQLLiteralImport(d) + "'"
+	}
+
+	if strings.Contains(meta.Extra, "auto_increment") {
+		return "NULL"
+	}
+
+	switch meta.DataType {
+	case "json":
+		return "CAST('null' AS JSON)"
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "decimal", "numeric", "float", "double", "real", "bit", "bool", "boolean":
+		return "0"
+	case "date":
+		return "'1970-01-01'"
+	case "datetime", "timestamp":
+		return "'1970-01-01 00:00:00'"
+	case "time":
+		return "'00:00:00'"
+	case "year":
+		return "1970"
+	default:
+		return "''"
+	}
+}
+
+func coerceNullValueImport(col string, val string, colMeta map[string]columnMeta) string {
+	if !strings.EqualFold(strings.TrimSpace(val), "NULL") {
+		return val
+	}
+	if colMeta == nil {
+		return val
+	}
+	meta, ok := colMeta[col]
+	if !ok || meta.IsNullable {
+		return val
+	}
+	replacement := defaultLiteralImport(meta)
+	if replacement == "" {
+		return val
+	}
+	return replacement
+}
+
 // buildUpsertSQL generates INSERT ... ON DUPLICATE KEY UPDATE for a single row.
 // backupCols is the full column list from the dump.
 // values is the full value list from the dump.
 // mysqlCols filters which columns exist in target MySQL.
 // pkCols lists PK columns (excluded from the UPDATE clause).
 func buildUpsertSQL(dbName, tableName string, backupCols []string, values []string,
-	mysqlCols map[string]bool, pkCols []string, jsonCols map[string]bool) string {
+	mysqlCols map[string]bool, pkCols []string, jsonCols map[string]bool, colMeta map[string]columnMeta) string {
 
 	pkSet := make(map[string]bool, len(pkCols))
 	for _, pk := range pkCols {
@@ -276,6 +453,7 @@ func buildUpsertSQL(dbName, tableName string, backupCols []string, values []stri
 			continue
 		}
 		val := values[i]
+		val = coerceNullValueImport(col, val, colMeta)
 		// For JSON columns, empty string is invalid — use CAST('null' AS JSON)
 		if jsonCols[col] && val == "''" {
 			val = "CAST('null' AS JSON)"
@@ -401,6 +579,8 @@ func main() {
 	pkColumns := detectPKColumnsMySQL(mysqlDB, *dbName)
 	jsonCols := detectJSONColumnsMySQL(mysqlDB, *dbName)
 	tableCols := detectTableColumnsMySQL(mysqlDB, *dbName)
+	tableColOrder := detectTableColumnOrderMySQL(mysqlDB, *dbName)
+	tableColMeta := detectColumnMetaMySQL(mysqlDB, *dbName)
 	existingTables := detectExistingTables(mysqlDB, *dbName)
 
 	{
@@ -416,6 +596,12 @@ func main() {
 		}
 		log.Printf("Schema loaded: %d tables, %d PK columns, %d JSON columns, %d total columns",
 			len(existingTables), pkCount, jsonCount, colCount)
+		if len(tableColOrder) == 0 {
+			log.Printf("WARNING: Could not load ordered column metadata; VALUES-only INSERT statements may be skipped")
+		}
+		if len(tableColMeta) == 0 {
+			log.Printf("WARNING: Could not load NOT NULL/default metadata; NULL coercion is disabled")
+		}
 	}
 
 	// ─── Output setup ───
@@ -472,17 +658,21 @@ func main() {
 	scanner.Buffer(make([]byte, 0, 64*1024*1024), 64*1024*1024) // 64MB line buffer for huge INSERT lines
 
 	var (
-		totalRows      int
-		totalStmts     int
-		execApplied    int
-		execFailed     int
-		skippedRows    int
-		skippedTables  = make(map[string]bool)
-		missingTables  = make(map[string]bool)
-		tablesImported = make(map[string]int)
-		lineNum        int
-		inCreateTable  bool
-		createDepth    int
+		totalRows       int
+		totalStmts      int
+		execApplied     int
+		execFailed      int
+		skippedRows     int
+		skippedTables   = make(map[string]bool)
+		missingTables   = make(map[string]bool)
+		tablesImported  = make(map[string]int)
+		dbSkipped       = make(map[string]bool)
+		noColsTables    = make(map[string]bool)
+		missingOrder    = make(map[string]bool)
+		lineNum         int
+		inCreateTable   bool
+		createDepth     int
+		currentSourceDB string
 	)
 
 	const txBatchSize = 1000
@@ -505,7 +695,7 @@ func main() {
 			}
 		}
 
-		stmt := buildUpsertSQL(*dbName, tblName, filteredCols, vals, nil, pkCols, jsonColSet)
+		stmt := buildUpsertSQL(*dbName, tblName, filteredCols, vals, nil, pkCols, jsonColSet, tableColMeta[tblName])
 		if stmt == "" {
 			skippedRows++
 			return
@@ -562,6 +752,11 @@ func main() {
 				continue
 			}
 
+			if useDB := parseUseDB(trimmed); useDB != "" {
+				currentSourceDB = useDB
+				continue
+			}
+
 			// Track and skip CREATE TABLE blocks if --skip-create
 			if *skipCreate {
 				if strings.HasPrefix(trimmed, "CREATE TABLE") {
@@ -580,7 +775,6 @@ func main() {
 			// Skip SET, USE, CREATE DATABASE and other non-INSERT statements
 			upper := strings.ToUpper(trimmed)
 			if strings.HasPrefix(upper, "SET ") ||
-				strings.HasPrefix(upper, "USE ") ||
 				strings.HasPrefix(upper, "CREATE DATABASE") ||
 				strings.HasPrefix(upper, "/*!") ||
 				strings.HasPrefix(upper, "DROP TABLE") ||
@@ -595,17 +789,27 @@ func main() {
 				continue
 			}
 
-			matches := reInsertHeader.FindStringSubmatch(trimmed)
-			if matches == nil {
+			h, ok := parseInsertHeader(trimmed)
+			if !ok {
 				continue
 			}
 
-			tblName := matches[1]
-			colList := parseColumnList(matches[2])
-			trailing := strings.TrimSpace(matches[3]) // data after VALUES (may be empty)
+			tblName := h.table
+			trailing := h.trailing // data after VALUES (may be empty)
+			sourceDB := h.sourceDB
+			if sourceDB == "" {
+				sourceDB = currentSourceDB
+			}
 
 			// Apply table filters
 			insertSkip = false
+			if sourceDB != "" && !strings.EqualFold(sourceDB, *dbName) {
+				insertSkip = true
+				if !dbSkipped[sourceDB] {
+					log.Printf("Skipping source database %s (target is %s)", sourceDB, *dbName)
+					dbSkipped[sourceDB] = true
+				}
+			}
 			if len(onlyTableSet) > 0 && !onlyTableSet[tblName] {
 				insertSkip = true
 			}
@@ -632,17 +836,44 @@ func main() {
 
 			curValidIdxs = nil
 			curCols = nil
-			droppedCols := 0
-			for i, col := range colList {
-				if mysqlColSet != nil && !mysqlColSet[col] {
-					droppedCols++
-					continue
+			if h.hasColumns {
+				droppedCols := 0
+				for i, col := range h.columns {
+					if mysqlColSet != nil && !mysqlColSet[col] {
+						droppedCols++
+						continue
+					}
+					curValidIdxs = append(curValidIdxs, i)
+					curCols = append(curCols, col)
 				}
-				curValidIdxs = append(curValidIdxs, i)
-				curCols = append(curCols, col)
+				if droppedCols > 0 && tablesImported[tblName] == 0 {
+					log.Printf("  Table %s: dropped %d column(s) not in MySQL schema", tblName, droppedCols)
+				}
+			} else {
+				curCols = append(curCols, tableColOrder[tblName]...)
+				if len(curCols) == 0 {
+					insertSkip = true
+					if !missingOrder[tblName] {
+						log.Printf("WARNING: Table %s has VALUES-only INSERT but ordered columns are unavailable — skipping", tblName)
+						missingOrder[tblName] = true
+					}
+				}
+				for i := range curCols {
+					curValidIdxs = append(curValidIdxs, i)
+				}
+				if len(curCols) > 0 && !noColsTables[tblName] {
+					log.Printf("  Table %s: using MySQL ordinal column mapping for VALUES-only INSERT", tblName)
+					noColsTables[tblName] = true
+				}
 			}
-			if droppedCols > 0 && tablesImported[tblName] == 0 {
-				log.Printf("  Table %s: dropped %d column(s) not in MySQL schema", tblName, droppedCols)
+
+			if len(curCols) == 0 {
+				insertSkip = true
+			}
+
+			if !h.hasColumns && mysqlColSet != nil {
+				// curCols already from MySQL schema order; keep mysqlColSet referenced for consistency
+				_ = mysqlColSet
 			}
 
 			// If there's data after VALUES on the same line (single-line format)
