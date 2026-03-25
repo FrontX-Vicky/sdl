@@ -633,6 +633,20 @@ func getenv(k, def string) string {
 	return def
 }
 
+func normalizeMySQLFlavor(raw string) string {
+	// Allow accidental inline comments in env value, e.g. "mysql # note".
+	v := strings.TrimSpace(raw)
+	if i := strings.Index(v, "#"); i >= 0 {
+		v = strings.TrimSpace(v[:i])
+	}
+	v = strings.ToLower(v)
+	if v == "mysql" || v == "mariadb" {
+		return v
+	}
+	log.Printf("Warning: invalid MYSQL_FLAVOR=%q, defaulting to mysql", raw)
+	return "mysql"
+}
+
 // runCanalWithRetry runs Canal with automatic reconnection on protocol errors
 func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetries int) error {
 	var lastErr error
@@ -734,7 +748,7 @@ func main() {
 	cfg.Addr = getenv("MYSQL_ADDR", "127.0.0.1:3306")
 	cfg.User = getenv("MYSQL_USER", "repl")
 	cfg.Password = os.Getenv("MYSQL_PASS")
-	cfg.Flavor = getenv("MYSQL_FLAVOR", "mysql")
+	cfg.Flavor = normalizeMySQLFlavor(getenv("MYSQL_FLAVOR", "mysql"))
 
 	// unique server id
 	if sid := getenv("MYSQL_SERVER_ID", "2222"); sid != "" {
