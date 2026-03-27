@@ -17,13 +17,15 @@ import (
 )
 
 type config struct {
-	DBUser       string
-	DBPass       string
-	DBHost       string
-	DBPort       string
-	BackupDir    string
-	MySQLBin     string
-	MySQLDumpBin string
+	DBUser        string
+	DBPass        string
+	DBHost        string
+	DBPort        string
+	BackupDir     string
+	MySQLBin      string
+	MySQLDumpBin  string
+	RetryCount    int
+	RetentionDays int
 }
 
 var systemDBs = []string{
@@ -78,18 +80,51 @@ func loadConfig() (config, error) {
 	}
 
 	cfg := config{
-		DBUser:       getenv("DB_USER", ""),
-		DBPass:       dbPass,
-		DBHost:       getenv("DB_HOST", "127.0.0.1"),
-		DBPort:       getenv("DB_PORT", "3306"),
-		BackupDir:    getenv("BACKUP_DIR", "/mnt/volume_1/backup/mysql_backup"),
-		MySQLBin:     getenv("MYSQL_BIN", "mysql"),
-		MySQLDumpBin: getenv("MYSQLDUMP_BIN", "mysqldump"),
+		DBUser:        getenv("DB_USER", ""),
+		DBPass:        dbPass,
+		DBHost:        getenv("DB_HOST", "127.0.0.1"),
+		DBPort:        getenv("DB_PORT", "3306"),
+		BackupDir:     getenv("BACKUP_DIR", "/mnt/volume_1/backup/mysql_backup"),
+		MySQLBin:      getenv("MYSQL_BIN", "mysql"),
+		MySQLDumpBin:  getenv("MYSQLDUMP_BIN", "mysqldump"),
+		RetryCount:    3,
+		RetentionDays: 5,
 	}
 	if cfg.DBUser == "" {
 		return cfg, fmt.Errorf("DB_USER is required")
 	}
 	return cfg, nil
+}
+
+func cleanupOldBackups(backupDir, currentRun string, retentionDays int) error {
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return err
+	}
+
+	currentRun = filepath.Clean(currentRun)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Clean(filepath.Join(backupDir, entry.Name()))
+		if path == currentRun {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			log.Printf("warning: could not read backup folder metadata: %s (%v)", path, err)
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			log.Printf("deleting old backup folder: %s", path)
+			if err := os.RemoveAll(path); err != nil {
+				return fmt.Errorf("delete old backup %s: %w", path, err)
+			}
+		}
+	}
+	return nil
 }
 
 func mysqlCmd(cfg config, bin string, args ...string) *exec.Cmd {
@@ -187,6 +222,25 @@ func dumpDatabase(cfg config, dbName, outFile string) error {
 	return nil
 }
 
+func dumpWithRetry(cfg config, dbName, outFile string) error {
+	var lastErr error
+	for attempt := 1; attempt <= cfg.RetryCount; attempt++ {
+		if attempt > 1 {
+			sleepFor := time.Duration(attempt*2) * time.Second
+			log.Printf("retrying database=%s in %s (attempt %d/%d)", dbName, sleepFor, attempt, cfg.RetryCount)
+			time.Sleep(sleepFor)
+		}
+
+		err := dumpDatabase(cfg, dbName, outFile)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("attempt %d/%d failed for database=%s: %v", attempt, cfg.RetryCount, dbName, err)
+	}
+	return fmt.Errorf("all %d attempts failed for database=%s: %w", cfg.RetryCount, dbName, lastErr)
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("mysql full backup started")
@@ -217,9 +271,13 @@ func main() {
 	for i, db := range dbs {
 		outFile := filepath.Join(runFolder, db+".sql.gz")
 		log.Printf("[%d/%d] processing %s", i+1, len(dbs), db)
-		if err := dumpDatabase(cfg, db, outFile); err != nil {
+		if err := dumpWithRetry(cfg, db, outFile); err != nil {
 			log.Fatalf("backup failed: %v", err)
 		}
+	}
+
+	if err := cleanupOldBackups(cfg.BackupDir, runFolder, cfg.RetentionDays); err != nil {
+		log.Fatalf("backup succeeded but cleanup failed: %v", err)
 	}
 
 	log.Printf("mysql full backup completed successfully in %s", time.Since(start).Round(time.Millisecond))

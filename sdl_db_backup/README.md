@@ -2,6 +2,10 @@
 
 Creates full MySQL backups per database, twice daily (07:30 and 14:00), using a separate user-level `systemd` service/timer.
 
+Behavior:
+- Retries each database dump up to 3 times before failing the run.
+- Deletes backup folders older than 5 days only after the current run finishes successfully.
+
 ## Files
 
 - `main.go`: Go backup runner (recommended for testing)
