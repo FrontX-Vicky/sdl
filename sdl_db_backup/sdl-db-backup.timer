@@ -1,8 +1,8 @@
 [Unit]
-Description=Run SDL MySQL backup at 08:00 and 14:00 daily
+Description=Run SDL MySQL backup at 07:30 and 14:00 daily
 
 [Timer]
-OnCalendar=*-*-* 08:00:00
+OnCalendar=*-*-* 07:30:00
 OnCalendar=*-*-* 14:00:00
 Persistent=true
 Unit=sdl-db-backup.service

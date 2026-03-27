@@ -6,7 +6,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/sdl/sdl_db_backup
-ExecStart=/bin/bash %h/sdl/sdl_db_backup/mysql_full_backup.sh
+Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
+Environment=BACKUP_ENV_FILE=.env
+ExecStart=/usr/bin/env go run main.go
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

@@ -1,6 +1,6 @@
 # SDL DB Backup
 
-Creates full MySQL backups per database, twice daily (08:00 and 14:00), using a separate user-level `systemd` service/timer.
+Creates full MySQL backups per database, twice daily (07:30 and 14:00), using a separate user-level `systemd` service/timer.
 
 ## Files
 
@@ -19,8 +19,8 @@ Creates full MySQL backups per database, twice daily (08:00 and 14:00), using a 
 2. For Go testing (logs progress in terminal):
    - `go run ./sdl_db_backup`
 
-3. Make bash script executable (optional):
-   - `chmod +x sdl_db_backup/mysql_full_backup.sh`
+3. Ensure `go` is available to the service user:
+   - `which go`
 
 4. Install user units:
    - `mkdir -p ~/.config/systemd/user`
