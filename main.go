@@ -357,32 +357,59 @@ func (s *MongoSink) writeBatchWithoutTransaction(ctx context.Context, docs []Eve
 	return nil
 }
 
-// RecoverPendingBatches attempts to recover uncommitted batches from staging collection
-// This handles the case where service crashed before flushing batch to MongoDB
+// RecoverPendingBatches re-applies any batches that were written to the staging
+// collection but not yet committed (e.g. the process crashed between staging and
+// the main write). Events are re-inserted idempotently (duplicate _id is ignored)
+// and the GTID checkpoint is updated before the staging doc is archived.
 func (s *MongoSink) RecoverPendingBatches(ctx context.Context) error {
+	type stagingDoc struct {
+		ID     string     `bson:"_id"`
+		Events []EventDoc `bson:"events"`
+		Source string     `bson:"source"`
+		GTID   string     `bson:"gtid"`
+		File   string     `bson:"file"`
+		Pos    uint32     `bson:"pos"`
+	}
+
 	cursor, err := s.staging.Find(ctx, bson.M{"status": "pending"})
 	if err != nil {
 		return fmt.Errorf("find pending batches: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	var stagingDocs []bson.M
-	if err := cursor.All(ctx, &stagingDocs); err != nil {
+	var docs []stagingDoc
+	if err := cursor.All(ctx, &docs); err != nil {
 		return fmt.Errorf("decode pending batches: %w", err)
 	}
 
-	if len(stagingDocs) > 0 {
-		for _, doc := range stagingDocs {
-			// Mark as archived (don't re-process)
-			_, _ = s.staging.UpdateByID(ctx, doc["_id"], bson.M{
-				"$set": bson.M{
-					"status":     "archived",
-					"archivedAt": time.Now().UTC(),
-				},
-			})
+	recovered := 0
+	for _, doc := range docs {
+		// Re-apply the events — duplicate _id entries are silently ignored by
+		// writeBatch so this is safe to call even if the events were partially written.
+		if writeErr := s.writeBatch(ctx, doc.Events); writeErr != nil {
+			log.Printf("Warning: recovery could not re-write events for batch %s: %v", doc.ID, writeErr)
+			// Continue anyway — we still want to advance the GTID if events are there.
 		}
+
+		// Advance the persisted GTID checkpoint to this batch's position.
+		if doc.GTID != "" {
+			if saveErr := s.saveGTID(ctx, doc.Source, doc.GTID, doc.File, doc.Pos); saveErr != nil {
+				log.Printf("Warning: recovery could not save GTID for batch %s: %v", doc.ID, saveErr)
+			}
+		}
+
+		_, _ = s.staging.UpdateByID(ctx, doc.ID, bson.M{
+			"$set": bson.M{
+				"status":     "archived",
+				"archivedAt": time.Now().UTC(),
+			},
+		})
+		recovered++
 	}
 
+	if recovered > 0 {
+		log.Printf("Recovered %d pending batch(es) from staging", recovered)
+	}
 	return nil
 }
 
@@ -619,8 +646,10 @@ func (h *Handler) OnTableChanged(header *replication.EventHeader, schema, table 
 func (h *Handler) OnXID(header *replication.EventHeader, nextPos mysql.Position) error { return nil }
 
 func (h *Handler) OnGTID(header *replication.EventHeader, ev mysql.BinlogGTIDEvent) error {
-	// Store a readable snapshot; BinlogGTIDEvent has no String()
-	h.lastGTID = fmt.Sprintf("%+v", ev)
+	// Intentionally left as a no-op.
+	// OnPosSynced is called after every event and receives the full mysql.GTIDSet
+	// with a proper String() representation. Using fmt.Sprintf("%+v", ev) here
+	// would store a Go-struct debug string that cannot be parsed back as a GTID set.
 	return nil
 }
 
@@ -647,10 +676,23 @@ func normalizeMySQLFlavor(raw string) string {
 	return "mysql"
 }
 
-// runCanalWithRetry runs Canal with automatic reconnection on protocol errors
-func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetries int) error {
+// runCanalWithRetry runs Canal with automatic reconnection on protocol errors.
+// A fresh Canal instance is created for every attempt because the go-mysql Canal
+// object is single-use: after Close() the syncer is not reset and cannot be
+// restarted (would immediately fail with "Sync is running, must Close first").
+func runCanalWithRetry(cfg *canal.Config, handler canal.EventHandler, sink *MongoSink, source string, maxRetries int) error {
 	var lastErr error
 	baseDelay := 2 * time.Second
+
+	isRecoverableErr := func(err error) bool {
+		errStr := err.Error()
+		return strings.Contains(errStr, "invalid sequence") ||
+			strings.Contains(errStr, "connection refused") ||
+			strings.Contains(errStr, "connection reset") ||
+			strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "EOF") ||
+			strings.Contains(errStr, "i/o timeout")
+	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
@@ -658,69 +700,66 @@ func runCanalWithRetry(c *canal.Canal, sink *MongoSink, source string, maxRetrie
 			if delay > 60*time.Second {
 				delay = 60 * time.Second
 			}
+			log.Printf("Canal retry attempt %d/%d, waiting %s", attempt+1, maxRetries, delay)
 			time.Sleep(delay)
 		}
 
-		// Load position from MongoDB
+		// Create a fresh Canal instance — the library does not support restart
+		// after Close(), so we always start with a clean object.
+		c, err := canal.NewCanal(cfg)
+		if err != nil {
+			lastErr = fmt.Errorf("create canal: %w", err)
+			continue
+		}
+		c.SetEventHandler(handler)
+
+		// Load the last committed GTID checkpoint from MongoDB.
 		gtidStr, ok, err := sink.loadGTID(context.Background(), source)
 		if err != nil {
 			log.Printf("Error: Could not load GTID from MongoDB: %v", err)
 		}
 
-		// Start Canal from saved position or master's current position
+		// StartFromGTID blocks until the canal stops or errors.
+		var runErr error
 		if ok && gtidStr != "" {
-			gtidSet, err := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtidStr)
-			if err != nil {
-				log.Printf("Error: Could not parse saved GTID '%s': %v, falling back to master position", gtidStr, err)
+			gtidSet, parseErr := mysql.ParseGTIDSet(mysql.MySQLFlavor, gtidStr)
+			if parseErr != nil {
+				log.Printf("Error: Could not parse saved GTID '%s': %v — falling back to master position", gtidStr, parseErr)
 				ok = false
 			} else {
-				if err := c.StartFromGTID(gtidSet); err != nil {
-					lastErr = fmt.Errorf("start from GTID: %w", err)
-					continue
+				log.Printf("Resuming from saved GTID: %s", gtidStr)
+				runErr = c.StartFromGTID(gtidSet)
+				if runErr != nil {
+					runErr = fmt.Errorf("start from GTID: %w", runErr)
 				}
 			}
 		}
 
-		if !ok || gtidStr == "" {
-			// No saved GTID, start from master's current position
-			gset, err := c.GetMasterGTIDSet()
-			if err != nil {
-				lastErr = fmt.Errorf("get master GTID: %w", err)
+		if runErr == nil && (!ok || gtidStr == "") {
+			gset, masterErr := c.GetMasterGTIDSet()
+			if masterErr != nil {
+				c.Close()
+				lastErr = fmt.Errorf("get master GTID: %w", masterErr)
 				continue
 			}
-			if err := c.StartFromGTID(gset); err != nil {
-				lastErr = fmt.Errorf("start from master GTID: %w", err)
-				continue
+			log.Printf("No saved GTID — starting from master position")
+			runErr = c.StartFromGTID(gset)
+			if runErr != nil {
+				runErr = fmt.Errorf("start from master GTID: %w", runErr)
 			}
 		}
 
-		// Run Canal - this blocks until error or stopped
-		err = c.Run()
+		c.Close() // always release resources for this attempt
 
-		if err == nil {
-			return nil // Normal shutdown
+		if runErr == nil {
+			return nil // clean shutdown (e.g. SIGTERM)
 		}
 
-		lastErr = err
-		errStr := err.Error()
+		lastErr = runErr
 
-		// Check for recoverable protocol errors
-		isRecoverable := strings.Contains(errStr, "invalid sequence") ||
-			strings.Contains(errStr, "connection refused") ||
-			strings.Contains(errStr, "connection reset") ||
-			strings.Contains(errStr, "broken pipe") ||
-			strings.Contains(errStr, "EOF") ||
-			strings.Contains(errStr, "i/o timeout")
-
-		if !isRecoverable {
-			return err
+		if !isRecoverableErr(runErr) {
+			return runErr
 		}
-
-		// Close the Canal instance to reset connection
-		c.Close()
-
-		// Brief pause before retry
-		time.Sleep(1 * time.Second)
 	}
 
 	return fmt.Errorf("canal retry exhausted after %d attempts: %w", maxRetries, lastErr)
@@ -766,18 +805,12 @@ func main() {
 	// No initial dump (start streaming). You can enable dump if you want a snapshot.
 	cfg.Dump.ExecutionPath = "" // no mysqldump
 
-	c, err := canal.NewCanal(cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	h := &Handler{
 		sink:         sink,
 		source:       "mysql://" + cfg.Addr,
 		loc:          loc,
 		tableSchemas: make(map[string][]string),
 	}
-	c.SetEventHandler(h)
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -792,9 +825,10 @@ func main() {
 			// Don't fail startup, continue with replication
 		}
 
-		// Run Canal with automatic retry on protocol errors
+		// Run Canal with automatic retry on protocol errors.
+		// Each attempt creates a fresh Canal instance from cfg.
 		// Max 10 retries with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s...)
-		if err := runCanalWithRetry(c, sink, h.source, 10); err != nil {
+		if err := runCanalWithRetry(cfg, h, sink, h.source, 10); err != nil {
 			errChan <- err
 			return
 		}
@@ -805,10 +839,9 @@ func main() {
 	case sig := <-sigChan:
 		_ = sig
 
-		// Stop canal from accepting new events
-		c.Close()
+		// Flush remaining batch and close MongoDB — Canal is managed inside
+		// runCanalWithRetry and is already closed when it returns.
 
-		// Flush remaining batch
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := h.Flush(ctx); err != nil {
 			log.Printf("Error flushing batch during shutdown: %v", err)
