@@ -436,9 +436,6 @@ func dumpDatabase(cfg config, dbName, outFile string) (int64, error) {
 		"--triggers",
 		"--events",
 		"--set-gtid-purged=OFF",
-		// Disable per-session query execution timeout to prevent Error 3024
-		// (max_execution_time exceeded) on slow or large views.
-		"--init-command=SET SESSION max_execution_time=0",
 		"--databases", dbName,
 	}
 	cmd := mysqlCmdContext(ctx, cfg, cfg.MySQLDumpBin, args...)
@@ -540,7 +537,7 @@ func retryDelay(cfg config, attempt int) time.Duration {
 
 func shouldRetry(category string) bool {
 	switch category {
-	case "auth", "permission", "disk", "view":
+	case "auth", "permission", "disk", "view", "config":
 		return false
 	default:
 		return true
@@ -571,6 +568,8 @@ func classifyFailure(err error, detail string) string {
 	case strings.Contains(text, "deadline exceeded"), strings.Contains(text, "timed out"),
 		strings.Contains(text, "error 3024"), strings.Contains(text, "max_execution_time"):
 		return "timeout"
+	case strings.Contains(text, "unknown variable"), strings.Contains(text, "unknown option"):
+		return "config"
 	case strings.Contains(text, "executable file not found"):
 		return "binary"
 	default:
