@@ -5,10 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/sdl/sdl_db_backup
+WorkingDirectory=/var/www/go-workspace/sdl/sdl_db_backup
 Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
-Environment=BACKUP_ENV_FILE=.env
-ExecStart=/usr/bin/env go run main.go
+Environment=HOME=/root
+Environment=GOPATH=/root/go
+Environment=GOCACHE=/root/.cache/go-build
+Environment=BACKUP_ENV_FILE=/var/www/go-workspace/sdl/sdl_db_backup/.env
+ExecStart=/usr/bin/env go run ./main.go
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+TimeoutStartSec=6h
+StandardOutput=journal
+StandardError=journal
