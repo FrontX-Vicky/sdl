@@ -2,3 +2,4 @@ sdl_fetch/fetch.exe
 .env.*
 sdl_db_backup/.env
 sdl_fetch/.env
+.env
