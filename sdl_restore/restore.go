@@ -79,6 +79,21 @@ func parseDate(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("cannot parse date %q (use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)", s)
 }
 
+// mergeDateTime replaces the time portion of base with the HH:MM:SS in timeStr.
+// base must be non-zero. timeStr must be in HH:MM:SS format.
+// The returned time is in UTC, matching the UTC normalisation applied by parseDate.
+func mergeDateTime(base time.Time, timeStr string) (time.Time, error) {
+	if base.IsZero() {
+		return time.Time{}, fmt.Errorf("base date must not be zero")
+	}
+	combined := base.UTC().Format("2006-01-02") + " " + timeStr
+	t, err := parseDate(combined)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid time %q: must be HH:MM:SS", timeStr)
+	}
+	return t, nil
+}
+
 func opName(op string) string {
 	switch op {
 	case "i":
@@ -604,8 +619,10 @@ type pkScanDoc struct {
 
 func main() {
 	// --- Flags ---
-	startDate := flag.String("start-date", "", "Start date UTC (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS) [required]")
-	endDate := flag.String("end-date", "", "End date UTC (optional)")
+	startDate := flag.String("start-date", "2026-05-27 09:30:00", "Start date UTC (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS) [required]")
+	startTimeFlag := flag.String("start-time", "", "Start time UTC (HH:MM:SS), combined with --start-date (overrides any time in --start-date)")
+	endDate := flag.String("end-date", "2026-05-27 11:00:00", "End date UTC (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS, optional)")
+	endTimeFlag := flag.String("end-time", "", "End time UTC (HH:MM:SS), combined with --end-date (overrides any time in --end-date)")
 	dbName := flag.String("db", "", "MySQL database name to filter [required]")
 	tableName := flag.String("table", "", "Table name (empty = all tables)")
 	pkColumn := flag.String("pk-column", "", "PK column override. Examples: 'id' | 'users:user_id,orders:order_id' | 'tbl:col1+col2'")
@@ -636,6 +653,8 @@ func main() {
 		fmt.Println("  sdl_restore --start-date 2026-03-01 --db myapp")
 		fmt.Println("  sdl_restore --start-date 2026-03-01 --db myapp --table users")
 		fmt.Println("  sdl_restore --start-date '2026-03-01 14:30:00' --db myapp --dry-run")
+		fmt.Println("  sdl_restore --start-date 2026-03-01 --start-time 09:00:00 --end-date 2026-03-01 --end-time 17:30:00 --db myapp")
+		fmt.Println("  sdl_restore --start-date 2026-03-01 --start-time 00:00:00 --end-date 2026-03-01 --end-time 23:59:59 --db myapp --dry-run")
 		fmt.Println("  sdl_restore --start-date 2026-03-01 --db myapp --execute --mysql-dsn 'root:pass@tcp(127.0.0.1:3306)/myapp'")
 		fmt.Println("  sdl_restore --start-date 2026-03-01 --db myapp --pk-column id")
 		fmt.Println("  sdl_restore --start-date 2026-03-01 --db myapp --pk-column 'users:user_id,orders:order_id'")
@@ -646,12 +665,30 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid --start-date: %v", err)
 	}
+	// Apply --start-time override (merges date from --start-date with the given HH:MM:SS)
+	if *startTimeFlag != "" {
+		startTime, err = mergeDateTime(startTime, *startTimeFlag)
+		if err != nil {
+			log.Fatalf("Invalid --start-time: %v", err)
+		}
+	}
 
 	var endTime time.Time
 	if *endDate != "" {
 		endTime, err = parseDate(*endDate)
 		if err != nil {
 			log.Fatalf("Invalid --end-date: %v", err)
+		}
+	}
+	// Apply --end-time override (merges date from --end-date with the given HH:MM:SS)
+	if *endTimeFlag != "" {
+		if *endDate == "" {
+			// Default to same date as start when end-date is omitted
+			endTime = startTime
+		}
+		endTime, err = mergeDateTime(endTime, *endTimeFlag)
+		if err != nil {
+			log.Fatalf("Invalid --end-time: %v", err)
 		}
 	}
 
