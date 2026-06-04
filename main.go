@@ -74,6 +74,40 @@ func toS(v any) string {
 	return fmt.Sprint(v)
 }
 
+func isDuplicateOnlyWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var bwe *mongo.BulkWriteException
+	if errors.As(err, &bwe) {
+		if len(bwe.WriteErrors) == 0 {
+			return false
+		}
+		for _, we := range bwe.WriteErrors {
+			if we.Code != 11000 {
+				return false
+			}
+		}
+		return true
+	}
+
+	var we mongo.WriteException
+	if errors.As(err, &we) {
+		if len(we.WriteErrors) == 0 {
+			return false
+		}
+		for _, writeErr := range we.WriteErrors {
+			if writeErr.Code != 11000 {
+				return false
+			}
+		}
+		return true
+	}
+
+	return false
+}
+
 // retryWithBackoff executes fn with exponential backoff retry on transient errors
 // maxRetries: maximum number of retry attempts (default 5)
 // initialDelay: initial delay between retries (default 100ms)
@@ -150,18 +184,8 @@ func (s *MongoSink) writeBatch(ctx context.Context, docs []EventDoc) error {
 	}
 	_, err := s.events.BulkWrite(ctx, ws, options.BulkWrite().SetOrdered(false))
 	if err != nil {
-		var bwe *mongo.BulkWriteException
-		if errors.As(err, &bwe) {
-			allDup := true
-			for _, we := range bwe.WriteErrors {
-				if we.Code != 11000 {
-					allDup = false
-					break
-				}
-			}
-			if allDup {
-				return nil
-			}
+		if isDuplicateOnlyWriteError(err) {
+			return nil
 		}
 		return err
 	}
@@ -191,7 +215,12 @@ func (s *MongoSink) writeBatchWithGTID(ctx context.Context, docs []EventDoc, sou
 	return retryWithBackoff(ctx, func(retryCtx context.Context) error {
 		// First, write to staging (crash recovery point)
 		if _, err := s.staging.InsertOne(retryCtx, stagingDoc); err != nil {
-			return fmt.Errorf("staging insert: %w", err)
+			if mongo.IsDuplicateKeyError(err) {
+				// A previous attempt already staged this exact batch.
+				// Continue so the data write + GTID checkpoint can converge.
+			} else {
+				return fmt.Errorf("staging insert: %w", err)
+			}
 		}
 
 		// Try with transaction if MongoDB supports it, fall back to non-transactional if not
@@ -273,22 +302,10 @@ func (s *MongoSink) writeBatchWithTransaction(ctx context.Context, docs []EventD
 		}
 		_, err := s.events.BulkWrite(sessCtx, ws, options.BulkWrite().SetOrdered(false))
 		if err != nil {
-			var bwe *mongo.BulkWriteException
-			if errors.As(err, &bwe) {
-				allDup := true
-				for _, we := range bwe.WriteErrors {
-					if we.Code != 11000 {
-						allDup = false
-						break
-					}
-				}
-				if !allDup {
-					return nil, err
-				}
-				// All duplicates, continue to save GTID
-			} else {
+			if !isDuplicateOnlyWriteError(err) {
 				return nil, err
 			}
+			// All duplicates, continue to save GTID
 		}
 
 		// Save GTID offset
@@ -322,22 +339,10 @@ func (s *MongoSink) writeBatchWithoutTransaction(ctx context.Context, docs []Eve
 	}
 	_, err := s.events.BulkWrite(ctx, ws, options.BulkWrite().SetOrdered(false))
 	if err != nil {
-		var bwe *mongo.BulkWriteException
-		if errors.As(err, &bwe) {
-			allDup := true
-			for _, we := range bwe.WriteErrors {
-				if we.Code != 11000 {
-					allDup = false
-					break
-				}
-			}
-			if !allDup {
-				return fmt.Errorf("bulk write events: %w", err)
-			}
-			// All duplicates, continue to save GTID
-		} else {
+		if !isDuplicateOnlyWriteError(err) {
 			return fmt.Errorf("bulk write events: %w", err)
 		}
+		// All duplicates, continue to save GTID
 	}
 
 	// Save GTID offset after events (best effort on non-transactional)
