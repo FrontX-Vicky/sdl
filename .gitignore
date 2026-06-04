@@ -3,3 +3,4 @@ sdl_fetch/fetch.exe
 sdl_db_backup/.env
 sdl_fetch/.env
 .env
+error.log
